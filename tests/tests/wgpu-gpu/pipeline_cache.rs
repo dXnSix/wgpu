@@ -4,6 +4,7 @@ use wgpu_test::{gpu_test, GpuTestConfiguration, TestParameters, TestingContext};
 
 pub fn all_tests(vec: &mut Vec<wgpu_test::GpuTestInitializer>) {
     vec.push(PIPELINE_CACHE);
+    vec.push(PIPELINE_CACHE_GL_PROGRAM_BINARIES);
 }
 
 /// We want to test that using a pipeline cache doesn't cause failure
@@ -193,4 +194,156 @@ async fn validate_pipeline(
     }
     drop(data);
     cpu_buffer.unmap();
+}
+
+/// On GL the cache holds program binaries: a pipeline created from a cache's data loads its
+/// program instead of compiling it and computes the same values, and corrupt data falls back to
+/// compiling. Other backends skip this test.
+#[gpu_test]
+static PIPELINE_CACHE_GL_PROGRAM_BINARIES: GpuTestConfiguration = GpuTestConfiguration::new()
+    .parameters(
+        TestParameters::default()
+            .test_features_limits()
+            .features(wgpu::Features::PIPELINE_CACHE),
+    )
+    .run_async(gl_program_binaries_test);
+
+/// The device's program binary counts (loaded, rejected), or `None` off GL.
+fn program_binary_counts(ctx: &TestingContext) -> Option<(u32, u32)> {
+    let device = unsafe { ctx.device.as_hal::<wgpu::hal::api::Gles>() }?;
+    Some(device.program_binary_counts())
+}
+
+async fn gl_program_binaries_test(ctx: TestingContext) {
+    if program_binary_counts(&ctx).is_none() {
+        return;
+    }
+    let source = shader();
+    // A new module each time: GL reuses a linked program for the same module and layout.
+    let module = || {
+        ctx.device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shader"),
+                source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
+            })
+    };
+    let bgl = ctx
+        .device
+        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("bind_group_layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: NonZeroU64::new(ARRAY_SIZE * 4),
+                },
+                count: None,
+            }],
+        });
+    let gpu_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("gpu_buffer"),
+        size: ARRAY_SIZE * 4,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let cpu_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("cpu_buffer"),
+        size: ARRAY_SIZE * 4,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let bind_group = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bind_group"),
+        layout: &bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: gpu_buffer.as_entire_binding(),
+        }],
+    });
+    let layout = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline_layout"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+    let cache = |data: Option<&[u8]>| unsafe {
+        ctx.device
+            .create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                label: Some("pipeline_cache"),
+                data,
+                fallback: true,
+            })
+    };
+    let pipeline = |cache: &wgpu::PipelineCache| {
+        ctx.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pipeline"),
+                layout: Some(&layout),
+                module: &module(),
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: Some(cache),
+            })
+    };
+
+    // First run: compile, link and store the binary.
+    let first = cache(None);
+    validate_pipeline(
+        &ctx,
+        pipeline(&first),
+        &bind_group,
+        &gpu_buffer,
+        &cpu_buffer,
+    )
+    .await;
+    assert_eq!(program_binary_counts(&ctx), Some((0, 0)));
+    let data = first.get_data().expect("GL caches have data");
+
+    // Second run from the data: the program is loaded, not compiled, and computes the same.
+    let second = cache(Some(&data));
+    validate_pipeline(
+        &ctx,
+        pipeline(&second),
+        &bind_group,
+        &gpu_buffer,
+        &cpu_buffer,
+    )
+    .await;
+    assert_eq!(
+        program_binary_counts(&ctx),
+        Some((1, 0)),
+        "the second pipeline loaded its program binary"
+    );
+    assert_eq!(
+        second.get_data().as_deref(),
+        Some(&data[..]),
+        "the loaded entry stays in the cache"
+    );
+
+    // Corrupt data: the damaged entry is dropped and the program compiled again.
+    let mut corrupt = data.clone();
+    let last = corrupt.len() - 9;
+    corrupt[last] ^= 0xff;
+    let third = cache(Some(&corrupt));
+    validate_pipeline(
+        &ctx,
+        pipeline(&third),
+        &bind_group,
+        &gpu_buffer,
+        &cpu_buffer,
+    )
+    .await;
+    assert_eq!(
+        program_binary_counts(&ctx),
+        Some((1, 0)),
+        "nothing was loaded from corrupt data"
+    );
+    assert_eq!(
+        third.get_data().as_deref(),
+        Some(&data[..]),
+        "the recompiled program's binary replaced the damaged one"
+    );
 }

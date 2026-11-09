@@ -53,6 +53,7 @@ Bottom level categories:
 #### GLES
 
 - Support EGL 1.4 drivers on Wayland, such as Mali's: get the display with `eglGetPlatformDisplayEXT` or `eglGetDisplay` when `eglGetPlatformDisplay` is missing, let window-capable configs present on Wayland without `EGL_NATIVE_RENDERABLE`, and retry window surfaces with `EGL_BACK_BUFFER` when `EGL_SINGLE_BUFFER` is refused. By @dXnSix in [#10708](https://github.com/gfx-rs/wgpu/issues/10708).
+- Implement `PipelineCache` with program binaries where the context offers them (GL ES 3.0, GL 4.1, `GL_ARB_get_program_binary`): `Features::PIPELINE_CACHE` is reported, programs load with `glProgramBinary` from cache data and fall back to compiling when the driver rejects them, and `util::pipeline_cache_key` returns a key for GL. By @dXnSix.
 
 ## v30.0.1 (2026-08-21)
 
