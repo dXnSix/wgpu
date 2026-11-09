@@ -170,6 +170,16 @@ pub fn pipeline_cache_key(adapter_info: &wgt::AdapterInfo) -> Option<String> {
             "wgpu_pipeline_cache_vulkan_{}_{}",
             adapter_info.vendor, adapter_info.device
         )),
+        // GL program binaries, keyed by the renderer (the driver version is validated later).
+        wgt::Backend::Gl => Some(format!(
+            "wgpu_pipeline_cache_gl_{}",
+            adapter_info
+                .name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .take(64)
+                .collect::<String>()
+        )),
         _ => None,
     }
 }

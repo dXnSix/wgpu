@@ -123,6 +123,15 @@ impl CompilationContext<'_> {
 }
 
 impl super::Device {
+    /// How many programs this device loaded from pipeline-cache program binaries, and how many
+    /// cached binaries the driver rejected (those programs were compiled instead).
+    pub fn program_binary_counts(&self) -> (u32, u32) {
+        (
+            self.program_binary_counts.loaded.load(Ordering::Relaxed),
+            self.program_binary_counts.rejected.load(Ordering::Relaxed),
+        )
+    }
+
     /// # Safety
     ///
     /// - `name` must be created respecting `desc`
@@ -289,13 +298,15 @@ impl super::Device {
         }
     }
 
-    fn create_shader(
+    /// A stage's GLSL source (translating it with naga and recording its reflection into
+    /// `context`), to compile or to key a program binary with.
+    fn shader_source<'s>(
         gl: &glow::Context,
         naga_stage: naga::ShaderStage,
-        stage: &crate::ProgrammableStage<super::ShaderModule>,
+        stage: &'s crate::ProgrammableStage<super::ShaderModule>,
         context: CompilationContext,
         program: glow::Program,
-    ) -> Result<glow::Shader, crate::PipelineError> {
+    ) -> Result<Cow<'s, str>, crate::PipelineError> {
         let source = 'outer: {
             use naga::back::glsl;
             let pipeline_options = glsl::PipelineOptions {
@@ -309,7 +320,7 @@ impl super::Device {
             let naga = match stage.module.source {
                 super::ShaderModuleSource::Naga(ref naga) => naga,
                 super::ShaderModuleSource::Passthrough { ref source } => {
-                    break 'outer Cow::Borrowed(source);
+                    break 'outer Cow::Borrowed(source.as_str());
                 }
             };
 
@@ -391,8 +402,7 @@ impl super::Device {
             );
             Cow::Owned(output)
         };
-
-        unsafe { Self::compile_shader(gl, &source, naga_stage, stage.module.label.as_deref()) }
+        Ok(source)
     }
 
     unsafe fn create_pipeline<'a>(
@@ -402,6 +412,7 @@ impl super::Device {
         layout: &super::PipelineLayout,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
+        cache: Option<&super::PipelineCache>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let mut program_stages = ArrayVec::new();
         let group_to_binding_to_slot = layout
@@ -431,7 +442,7 @@ impl super::Device {
                 group_to_binding_to_slot: group_to_binding_to_slot.into_boxed_slice(),
             })
             .or_insert_with(|| unsafe {
-                Self::create_program(
+                self.create_program(
                     gl,
                     shaders,
                     layout,
@@ -439,6 +450,7 @@ impl super::Device {
                     multiview_mask,
                     self.shared.shading_language_version,
                     self.shared.private_caps,
+                    cache,
                 )
             })
             .to_owned()?;
@@ -458,7 +470,9 @@ impl super::Device {
         buf
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn create_program<'a>(
+        &self,
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
         layout: &super::PipelineLayout,
@@ -466,6 +480,7 @@ impl super::Device {
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
+        cache: Option<&super::PipelineCache>,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let glsl_version = match glsl_version {
             naga::back::glsl::Version::Embedded { version, .. } => format!("{version} es"),
@@ -484,7 +499,7 @@ impl super::Device {
         let mut immediates_items = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut sampler_map = [None; super::MAX_TEXTURE_SLOTS];
         let mut has_stages = wgt::ShaderStages::empty();
-        let mut shaders_to_delete = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
+        let mut sources = ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
         let mut clip_distance_count = 0;
 
         for &(naga_stage, stage) in &shaders {
@@ -502,43 +517,103 @@ impl super::Device {
                 clip_distance_count: &mut clip_distance_count,
             };
 
-            let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
-            shaders_to_delete.push(shader);
+            let source = Self::shader_source(gl, naga_stage, stage, context, program)?;
+            sources.push((naga_stage, source, stage.module.label.as_deref()));
         }
 
         // Create empty fragment shader if only vertex shader is present
         if has_stages == wgt::ShaderStages::VERTEX {
             let shader_src = format!("#version {glsl_version}\n void main(void) {{}}",);
             log::debug!("Only vertex shader is present. Creating an empty fragment shader",);
-            let shader = unsafe {
-                Self::compile_shader(
-                    gl,
-                    &shader_src,
-                    naga::ShaderStage::Fragment,
-                    Some("(wgpu internal) dummy fragment shader"),
-                )
-            }?;
-            shaders_to_delete.push(shader);
+            sources.push((
+                naga::ShaderStage::Fragment,
+                Cow::Owned(shader_src),
+                Some("(wgpu internal) dummy fragment shader"),
+            ));
         }
 
-        for &shader in shaders_to_delete.iter() {
-            unsafe { gl.attach_shader(program, shader) };
+        // A program binary from the pipeline cache replaces compiling and linking.
+        let binary_key = match (cache, self.shared.program_binaries) {
+            (Some(_), Some(adapter)) => Some(super::pipeline_cache::program_key(
+                &adapter,
+                sources.iter().map(|(_, source, _)| source.as_ref()),
+            )),
+            _ => None,
+        };
+        let cached = cache
+            .zip(binary_key)
+            .and_then(|(cache, key)| cache.entries.lock().get(&key).cloned());
+        let mut linked_from_binary = false;
+        if let Some(binary) = cached {
+            let binary = glow::ProgramBinary {
+                buffer: binary.data,
+                format: binary.format,
+            };
+            unsafe { gl.program_binary(program, &binary) };
+            if unsafe { gl.get_program_link_status(program) } {
+                log::debug!("\tLoaded program {program:?} from its binary");
+                self.program_binary_counts
+                    .loaded
+                    .fetch_add(1, Ordering::Relaxed);
+                linked_from_binary = true;
+            } else {
+                // The driver changed or the binary is unusable: compile instead.
+                log::debug!("\tThe driver rejected the program binary; compiling");
+                self.program_binary_counts
+                    .rejected
+                    .fetch_add(1, Ordering::Relaxed);
+            }
         }
-        unsafe { gl.link_program(program) };
 
-        for shader in shaders_to_delete {
-            unsafe { gl.delete_shader(shader) };
-        }
+        if !linked_from_binary {
+            let mut shaders_to_delete =
+                ArrayVec::<_, { crate::MAX_CONCURRENT_SHADER_STAGES }>::new();
+            for (naga_stage, source, label) in &sources {
+                match unsafe { Self::compile_shader(gl, source, *naga_stage, *label) } {
+                    Ok(shader) => shaders_to_delete.push(shader),
+                    Err(error) => {
+                        for shader in shaders_to_delete {
+                            unsafe { gl.delete_shader(shader) };
+                        }
+                        return Err(error);
+                    }
+                }
+            }
 
-        log::debug!("\tLinked program {program:?}");
+            for &shader in shaders_to_delete.iter() {
+                unsafe { gl.attach_shader(program, shader) };
+            }
+            if binary_key.is_some() {
+                unsafe { gl.program_binary_retrievable_hint(program, true) };
+            }
+            unsafe { gl.link_program(program) };
 
-        let linked_ok = unsafe { gl.get_program_link_status(program) };
-        let msg = unsafe { gl.get_program_info_log(program) };
-        if !linked_ok {
-            return Err(crate::PipelineError::Linkage(has_stages, msg));
-        }
-        if !msg.is_empty() {
-            log::debug!("\tLink message: {msg}");
+            for shader in shaders_to_delete {
+                unsafe { gl.delete_shader(shader) };
+            }
+
+            log::debug!("\tLinked program {program:?}");
+
+            let linked_ok = unsafe { gl.get_program_link_status(program) };
+            let msg = unsafe { gl.get_program_info_log(program) };
+            if !linked_ok {
+                return Err(crate::PipelineError::Linkage(has_stages, msg));
+            }
+            if !msg.is_empty() {
+                log::debug!("\tLink message: {msg}");
+            }
+
+            if let (Some(cache), Some(key)) = (cache, binary_key) {
+                if let Some(binary) = unsafe { gl.get_program_binary(program) } {
+                    cache.entries.lock().insert(
+                        key,
+                        super::pipeline_cache::Binary {
+                            format: binary.format,
+                            data: binary.buffer,
+                        },
+                    );
+                }
+            }
         }
 
         if !private_caps.contains(PrivateCapabilities::SHADER_BINDING_LAYOUT) {
@@ -1526,7 +1601,14 @@ impl crate::Device for super::Device {
             shaders.push((naga::ShaderStage::Fragment, fs));
         }
         let inner = unsafe {
-            self.create_pipeline(gl, shaders, desc.layout, desc.label, desc.multiview_mask)
+            self.create_pipeline(
+                gl,
+                shaders,
+                desc.layout,
+                desc.label,
+                desc.multiview_mask,
+                desc.cache,
+            )
         }?;
 
         let (vertex_buffers, vertex_attributes) = {
@@ -1622,7 +1704,9 @@ impl crate::Device for super::Device {
         let gl = &self.shared.context.lock();
         let mut shaders = ArrayVec::new();
         shaders.push((naga::ShaderStage::Compute, &desc.stage));
-        let inner = unsafe { self.create_pipeline(gl, shaders, desc.layout, desc.label, None) }?;
+        let inner = unsafe {
+            self.create_pipeline(gl, shaders, desc.layout, desc.label, None, desc.cache)
+        }?;
 
         self.counters.compute_pipelines.add(1);
 
@@ -1672,13 +1756,29 @@ impl crate::Device for super::Device {
 
     unsafe fn create_pipeline_cache(
         &self,
-        _: &crate::PipelineCacheDescriptor<'_>,
+        desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
-        // Even though the cache doesn't do anything, we still return something here
-        // as the least bad option
-        Ok(super::PipelineCache)
+        // Without program binaries the cache stays empty and changes nothing.
+        let entries = match (self.shared.program_binaries, desc.data) {
+            (Some(adapter), Some(data)) => super::pipeline_cache::decode(&adapter, data),
+            _ => Default::default(),
+        };
+        Ok(super::PipelineCache {
+            entries: parking_lot::Mutex::new(entries),
+        })
+    }
+    fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
+        self.shared.program_binaries
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
+
+    unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
+        let adapter = self.shared.program_binaries?;
+        Some(super::pipeline_cache::encode(
+            &adapter,
+            &cache.entries.lock(),
+        ))
+    }
 
     #[cfg_attr(target_arch = "wasm32", allow(unused))]
     unsafe fn create_query_set(

@@ -50,6 +50,10 @@ Bottom level categories:
 - Fix a texture id leak when surface acquire returns no texture. By @jnb in [#10184](https://github.com/gfx-rs/wgpu/pull/10184).
 - Fix a use after free of a mapped buffer when its device is lost or destroyed. By @uael in [#10593](https://github.com/gfx-rs/wgpu/pull/10593).
 
+#### GLES
+
+- Implement `PipelineCache` with program binaries where the context offers them (GL ES 3.0, GL 4.1, `GL_ARB_get_program_binary`): `Features::PIPELINE_CACHE` is reported, programs load with `glProgramBinary` from cache data and fall back to compiling when the driver rejects them, and `util::pipeline_cache_key` returns a key for GL. By @dXnSix.
+
 ## v30.0.1 (2026-08-21)
 
 ### Bug Fixes
