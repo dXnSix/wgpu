@@ -50,6 +50,10 @@ Bottom level categories:
 - Fix a texture id leak when surface acquire returns no texture. By @jnb in [#10184](https://github.com/gfx-rs/wgpu/pull/10184).
 - Fix a use after free of a mapped buffer when its device is lost or destroyed. By @uael in [#10593](https://github.com/gfx-rs/wgpu/pull/10593).
 
+#### GLES
+
+- Support EGL 1.4 drivers on Wayland, such as Mali's: get the display with `eglGetPlatformDisplayEXT` or `eglGetDisplay` when `eglGetPlatformDisplay` is missing, let window-capable configs present on Wayland without `EGL_NATIVE_RENDERABLE`, and retry window surfaces with `EGL_BACK_BUFFER` when `EGL_SINGLE_BUFFER` is refused. By @dXnSix in [#10708](https://github.com/gfx-rs/wgpu/issues/10708).
+
 ## v30.0.1 (2026-08-21)
 
 ### Bug Fixes

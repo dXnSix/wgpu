@@ -48,6 +48,13 @@ const EGL_DEBUG_MSG_ERROR_KHR: u32 = 0x33BA;
 const EGL_DEBUG_MSG_WARN_KHR: u32 = 0x33BB;
 const EGL_DEBUG_MSG_INFO_KHR: u32 = 0x33BC;
 
+/// `eglGetPlatformDisplayEXT` (`EGL_EXT_platform_base`), for EGL 1.4 displays.
+type EglGetPlatformDisplayExtFun = unsafe extern "system" fn(
+    platform: khronos_egl::Enum,
+    native_display: *mut ffi::c_void,
+    attrib_list: *const khronos_egl::Int,
+) -> khronos_egl::EGLDisplay;
+
 type EglDebugMessageControlFun = unsafe extern "system" fn(
     proc: EGLDEBUGPROCKHR,
     attrib_list: *const khronos_egl::Attrib,
@@ -90,76 +97,103 @@ enum SrgbFrameBufferKind {
     Khr,
 }
 
-/// Choose GLES framebuffer configuration.
-fn choose_config(
-    egl: &EglInstance,
-    display: khronos_egl::Display,
-    srgb_kind: SrgbFrameBufferKind,
-) -> Result<(khronos_egl::Config, bool), crate::InstanceError> {
-    //TODO: EGL_SLOW_CONFIG
-    let tiers = [
-        (
-            "off-screen",
-            &[
-                khronos_egl::SURFACE_TYPE,
-                khronos_egl::PBUFFER_BIT,
-                khronos_egl::RENDERABLE_TYPE,
-                khronos_egl::OPENGL_ES2_BIT,
-            ][..],
-        ),
-        (
-            "presentation",
-            &[khronos_egl::SURFACE_TYPE, khronos_egl::WINDOW_BIT][..],
-        ),
-        #[cfg(not(target_os = "android"))]
-        (
-            "native-render",
-            &[khronos_egl::NATIVE_RENDERABLE, khronos_egl::TRUE as _][..],
-        ),
-    ];
+/// The config tiers, from the least to the most demanding: an off-screen config, one that can
+/// present to a window, one that is natively renderable.
+const CONFIG_TIERS: &[(&str, &[khronos_egl::Int])] = &[
+    (
+        "off-screen",
+        &[
+            khronos_egl::SURFACE_TYPE,
+            khronos_egl::PBUFFER_BIT,
+            khronos_egl::RENDERABLE_TYPE,
+            khronos_egl::OPENGL_ES2_BIT,
+        ],
+    ),
+    (
+        "presentation",
+        &[khronos_egl::SURFACE_TYPE, khronos_egl::WINDOW_BIT],
+    ),
+    #[cfg(not(target_os = "android"))]
+    (
+        "native-render",
+        &[khronos_egl::NATIVE_RENDERABLE, khronos_egl::TRUE as _],
+    ),
+];
 
+/// The lowest tier whose configs can present to a window of `kind`. Where EGL presents through
+/// the platform's own buffers (Android, Windows, OHOS, and Wayland, whose `wl_egl_window`
+/// buffers drivers may not report as natively renderable, see issue #10708), the presentation
+/// tier is enough; elsewhere a config must be natively renderable.
+fn presentable_tier(kind: WindowKind) -> usize {
+    if cfg!(target_os = "android")
+        || cfg!(windows)
+        || cfg!(target_env = "ohos")
+        || kind == WindowKind::Wayland
+    {
+        1
+    } else {
+        2
+    }
+}
+
+/// The most demanding tier of `tiers` for which `find` (`eglChooseConfig`, first match) returns a
+/// config, with that tier's index. Each tier's attribute list includes the lower tiers', then
+/// `ALPHA_SIZE` 8 when `alpha`, then `NONE`.
+fn choose_tier<C>(
+    tiers: &[(&str, &[khronos_egl::Int])],
+    alpha: bool,
+    mut find: impl FnMut(&str, &[khronos_egl::Int]) -> Option<C>,
+) -> Option<(C, usize)> {
     let mut attributes = Vec::with_capacity(9);
     for tier_max in (0..tiers.len()).rev() {
-        let name = tiers[tier_max].0;
-        log::debug!("\tTrying {name}");
-
         attributes.clear();
         for &(_, tier_attr) in tiers[..=tier_max].iter() {
             attributes.extend_from_slice(tier_attr);
         }
-        // make sure the Alpha is enough to support sRGB
-        match srgb_kind {
-            SrgbFrameBufferKind::None => {}
-            _ => {
-                attributes.push(khronos_egl::ALPHA_SIZE);
-                attributes.push(8);
-            }
+        if alpha {
+            attributes.push(khronos_egl::ALPHA_SIZE);
+            attributes.push(8);
         }
         attributes.push(khronos_egl::NONE);
+        if let Some(config) = find(tiers[tier_max].0, &attributes) {
+            return Some((config, tier_max));
+        }
+    }
+    None
+}
 
-        match egl.choose_first_config(display, &attributes) {
-            Ok(Some(config)) => {
-                if tier_max == 1 {
-                    //Note: this has been confirmed to malfunction on Intel+NV laptops,
-                    // but also on Angle.
-                    log::info!("EGL says it can present to the window but not natively",);
-                }
-                // Android emulator can't natively present either.
-                let tier_threshold =
-                    if cfg!(target_os = "android") || cfg!(windows) || cfg!(target_env = "ohos") {
-                        1
-                    } else {
-                        2
-                    };
-                return Ok((config, tier_max >= tier_threshold));
-            }
+/// Choose GLES framebuffer configuration, and whether it can present to a window of `kind`.
+fn choose_config(
+    egl: &EglInstance,
+    display: khronos_egl::Display,
+    srgb_kind: SrgbFrameBufferKind,
+    kind: WindowKind,
+) -> Result<(khronos_egl::Config, bool), crate::InstanceError> {
+    //TODO: EGL_SLOW_CONFIG
+    // make sure the Alpha is enough to support sRGB
+    let alpha = !matches!(srgb_kind, SrgbFrameBufferKind::None);
+    let chosen = choose_tier(CONFIG_TIERS, alpha, |name, attributes| {
+        log::debug!("\tTrying {name}");
+        match egl.choose_first_config(display, attributes) {
+            Ok(Some(config)) => Some(config),
             Ok(None) => {
                 log::debug!("No config found!");
+                None
             }
             Err(e) => {
                 log::error!("error in choose_first_config: {e:?}");
+                None
             }
         }
+    });
+    if let Some((config, tier)) = chosen {
+        if tier == 1 {
+            //Note: this has been confirmed to malfunction on Intel+NV laptops,
+            // but also on Angle.
+            log::info!("EGL says it can present to the window but not natively",);
+        }
+        // Android emulator can't natively present either.
+        return Ok((config, tier >= presentable_tier(kind)));
     }
 
     // TODO: include diagnostic details that are currently logged
@@ -403,6 +437,7 @@ impl Inner {
         egl: Arc<EglInstance>,
         display: khronos_egl::Display,
         force_gles_minor_version: wgt::Gles3MinorVersion,
+        kind: WindowKind,
     ) -> Result<Self, crate::InstanceError> {
         let version = initialize_display(&egl, display)
             .map_err(instance_err("failed to initialize EGL display connection"))?;
@@ -449,7 +484,7 @@ impl Inner {
             }
         }
 
-        let (config, supports_native_window) = choose_config(&egl, display, srgb_kind)?;
+        let (config, supports_native_window) = choose_config(&egl, display, srgb_kind, kind)?;
 
         let supports_opengl = if version >= (1, 4) {
             let client_apis = egl
@@ -669,6 +704,74 @@ impl Drop for Inner {
     }
 }
 
+/// How to get the EGL display for a Wayland `wl_display`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaylandDisplayPath {
+    /// EGL 1.5's `eglGetPlatformDisplay`.
+    Platform,
+    /// `eglGetPlatformDisplayEXT`, on EGL 1.4 with `EGL_EXT_platform_base` and
+    /// `EGL_EXT_platform_wayland`.
+    PlatformExt,
+    /// `eglGetDisplay` on the `wl_display`, on EGL 1.4 without them (as flutter-tizen and DALi
+    /// call it; issue #10708).
+    Native,
+}
+
+fn has_extension(extensions: &str, name: &str) -> bool {
+    extensions
+        .split_whitespace()
+        .any(|extension| extension == name)
+}
+
+/// The display path for a Wayland display, from whether EGL 1.5's entry points exist and the
+/// client extensions. `None` leaves the choice to the other platforms (EGL 1.5 without
+/// `EGL_EXT_platform_wayland`).
+fn wayland_display_path(egl1_5: bool, client_extensions: &str) -> Option<WaylandDisplayPath> {
+    if egl1_5 {
+        client_extensions
+            .contains("EGL_EXT_platform_wayland")
+            .then_some(WaylandDisplayPath::Platform)
+    } else if has_extension(client_extensions, "EGL_EXT_platform_base")
+        && has_extension(client_extensions, "EGL_EXT_platform_wayland")
+    {
+        Some(WaylandDisplayPath::PlatformExt)
+    } else {
+        Some(WaylandDisplayPath::Native)
+    }
+}
+
+/// The `EGL_RENDER_BUFFER` a window surface asks for. We don't want any of the buffering done by
+/// the driver, because we manage a swapchain on our side, but some drivers fail on surface
+/// creation seeing `EGL_SINGLE_BUFFER`.
+fn render_buffer(kind: WindowKind) -> khronos_egl::Int {
+    if cfg!(any(
+        target_os = "android",
+        target_os = "macos",
+        target_env = "ohos"
+    )) || cfg!(windows)
+        || kind == WindowKind::AngleX11
+    {
+        khronos_egl::BACK_BUFFER
+    } else {
+        khronos_egl::SINGLE_BUFFER
+    }
+}
+
+/// The render buffer to retry with once after creating a window surface with `requested` failed:
+/// `EGL_BACK_BUFFER` when `EGL_SINGLE_BUFFER` was refused as a bad attribute or match (Mali on
+/// Wayland, issue #10708).
+fn render_buffer_retry(
+    requested: khronos_egl::Int,
+    error: khronos_egl::Error,
+) -> Option<khronos_egl::Int> {
+    (requested == khronos_egl::SINGLE_BUFFER
+        && matches!(
+            error,
+            khronos_egl::Error::BadAttribute | khronos_egl::Error::BadMatch
+        ))
+    .then_some(khronos_egl::BACK_BUFFER)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WindowKind {
     Wayland,
@@ -766,20 +869,64 @@ impl crate::Instance for Instance {
         #[cfg(Emscripten)]
         let egl1_5: Option<&Arc<EglInstance>> = Some(&egl);
 
+        let wayland_path = match desc.display.map(|d| d.as_raw()) {
+            Some(Rdh::Wayland(_)) => wayland_display_path(egl1_5.is_some(), &client_ext_str),
+            _ => None,
+        };
+
         let (display, wsi_kind) = match (desc.display.map(|d| d.as_raw()), egl1_5) {
-            (Some(Rdh::Wayland(wayland_display_handle)), Some(egl))
-                if client_ext_str.contains("EGL_EXT_platform_wayland") =>
-            {
-                log::debug!("Using Wayland platform");
-                let display_attributes = [khronos_egl::ATTRIB_NONE];
-                let display = unsafe {
-                    egl.get_platform_display(
-                        EGL_PLATFORM_WAYLAND_KHR,
-                        wayland_display_handle.display.as_ptr(),
-                        &display_attributes,
-                    )
-                }
-                .map_err(instance_err("failed to get Wayland display"))?;
+            (Some(Rdh::Wayland(wayland_display_handle)), egl1_5) if wayland_path.is_some() => {
+                let native = wayland_display_handle.display.as_ptr();
+                let display = match (wayland_path, egl1_5) {
+                    (Some(WaylandDisplayPath::Platform), Some(egl)) => {
+                        log::debug!("Using Wayland platform");
+                        let display_attributes = [khronos_egl::ATTRIB_NONE];
+                        unsafe {
+                            egl.get_platform_display(
+                                EGL_PLATFORM_WAYLAND_KHR,
+                                native,
+                                &display_attributes,
+                            )
+                        }
+                        .map_err(instance_err("failed to get Wayland display"))?
+                    }
+                    (Some(WaylandDisplayPath::PlatformExt), _) => {
+                        log::debug!("Using Wayland platform through EGL_EXT_platform_base");
+                        let function: EglGetPlatformDisplayExtFun = {
+                            let addr = egl
+                                .get_proc_address("eglGetPlatformDisplayEXT")
+                                .ok_or_else(|| {
+                                    crate::InstanceError::new(
+                                        "failed to get `eglGetPlatformDisplayEXT` proc address"
+                                            .into(),
+                                    )
+                                })?;
+                            unsafe { core::mem::transmute(addr) }
+                        };
+                        let display_attributes = [khronos_egl::NONE];
+                        let raw = unsafe {
+                            (function)(
+                                EGL_PLATFORM_WAYLAND_KHR,
+                                native,
+                                display_attributes.as_ptr(),
+                            )
+                        };
+                        if raw == khronos_egl::NO_DISPLAY {
+                            return Err(crate::InstanceError::new(
+                                "failed to get Wayland display (eglGetPlatformDisplayEXT)".into(),
+                            ));
+                        }
+                        unsafe { khronos_egl::Display::from_ptr(raw) }
+                    }
+                    _ => {
+                        log::debug!("Using Wayland through eglGetDisplay (EGL 1.4)");
+                        unsafe { egl.get_display(native) }.ok_or_else(|| {
+                            crate::InstanceError::new(
+                                "failed to get Wayland display (eglGetDisplay)".into(),
+                            )
+                        })?
+                    }
+                };
                 (display, WindowKind::Wayland)
             }
             (Some(Rdh::Xlib(xlib_display_handle)), Some(egl))
@@ -908,6 +1055,7 @@ impl crate::Instance for Instance {
             egl,
             display,
             desc.backend_options.gl.gles_minor_version,
+            wsi_kind,
         )?;
 
         Ok(Instance {
@@ -1301,37 +1449,25 @@ impl crate::Surface for Surface {
                     }
                 };
 
-                let mut attributes = vec![
-                    khronos_egl::RENDER_BUFFER,
-                    // We don't want any of the buffering done by the driver, because we
-                    // manage a swapchain on our side.
-                    // Some drivers just fail on surface creation seeing `EGL_SINGLE_BUFFER`.
-                    if cfg!(any(
-                        target_os = "android",
-                        target_os = "macos",
-                        target_env = "ohos"
-                    )) || cfg!(windows)
-                        || self.wsi.kind == WindowKind::AngleX11
-                    {
-                        khronos_egl::BACK_BUFFER
-                    } else {
-                        khronos_egl::SINGLE_BUFFER
-                    },
-                ];
-                if config.format.is_srgb() {
-                    match self.srgb_kind {
-                        SrgbFrameBufferKind::None => {}
-                        SrgbFrameBufferKind::Core => {
-                            attributes.push(khronos_egl::GL_COLORSPACE);
-                            attributes.push(khronos_egl::GL_COLORSPACE_SRGB);
-                        }
-                        SrgbFrameBufferKind::Khr => {
-                            attributes.push(EGL_GL_COLORSPACE_KHR as i32);
-                            attributes.push(EGL_GL_COLORSPACE_SRGB_KHR as i32);
+                let srgb = config.format.is_srgb();
+                let surface_attributes = |render_buffer: khronos_egl::Int| {
+                    let mut attributes = vec![khronos_egl::RENDER_BUFFER, render_buffer];
+                    if srgb {
+                        match self.srgb_kind {
+                            SrgbFrameBufferKind::None => {}
+                            SrgbFrameBufferKind::Core => {
+                                attributes.push(khronos_egl::GL_COLORSPACE);
+                                attributes.push(khronos_egl::GL_COLORSPACE_SRGB);
+                            }
+                            SrgbFrameBufferKind::Khr => {
+                                attributes.push(EGL_GL_COLORSPACE_KHR as i32);
+                                attributes.push(EGL_GL_COLORSPACE_SRGB_KHR as i32);
+                            }
                         }
                     }
-                }
-                attributes.push(khronos_egl::ATTRIB_NONE as i32);
+                    attributes.push(khronos_egl::ATTRIB_NONE as i32);
+                    attributes
+                };
 
                 #[cfg(not(Emscripten))]
                 let egl1_5 = self.egl.instance.upcast::<khronos_egl::EGL1_5>();
@@ -1340,7 +1476,7 @@ impl crate::Surface for Surface {
                 let egl1_5: Option<&Arc<EglInstance>> = Some(&self.egl.instance);
 
                 // Careful, we can still be in 1.4 version even if `upcast` succeeds
-                let raw_result = match egl1_5 {
+                let create = |attributes: Vec<khronos_egl::Int>| match egl1_5 {
                     Some(egl) if self.wsi.kind != WindowKind::Unknown => {
                         let attributes_usize = attributes
                             .into_iter()
@@ -1363,6 +1499,19 @@ impl crate::Surface for Surface {
                             Some(&attributes),
                         )
                     },
+                };
+                let requested = render_buffer(self.wsi.kind);
+                let raw_result = match create(surface_attributes(requested)) {
+                    Err(error) => match render_buffer_retry(requested, error) {
+                        Some(fallback) => {
+                            log::info!(
+                                "EGL refused EGL_SINGLE_BUFFER ({error:?}); retrying with EGL_BACK_BUFFER"
+                            );
+                            create(surface_attributes(fallback))
+                        }
+                        None => Err(error),
+                    },
+                    ok => ok,
                 };
 
                 match raw_result {
@@ -1467,4 +1616,158 @@ impl crate::Surface for Surface {
         })
     }
     unsafe fn discard_texture(&self, _texture: super::Texture) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_path() {
+        let ext = "EGL_EXT_platform_base EGL_EXT_platform_wayland EGL_KHR_platform_wayland";
+        assert_eq!(
+            wayland_display_path(true, ext),
+            Some(WaylandDisplayPath::Platform)
+        );
+        assert_eq!(
+            wayland_display_path(true, "EGL_EXT_platform_x11"),
+            None,
+            "EGL 1.5 without Wayland support leaves the choice to the other platforms"
+        );
+        // EGL 1.4, as on the Mali driver of issue #10708 and Tizen TVs.
+        assert_eq!(
+            wayland_display_path(false, ext),
+            Some(WaylandDisplayPath::PlatformExt)
+        );
+        assert_eq!(
+            wayland_display_path(false, "EGL_EXT_platform_wayland"),
+            Some(WaylandDisplayPath::Native),
+            "no eglGetPlatformDisplayEXT without EGL_EXT_platform_base"
+        );
+        assert_eq!(
+            wayland_display_path(false, "EGL_EXT_platform_base EGL_EXT_platform_wayland_x"),
+            Some(WaylandDisplayPath::Native),
+            "extension names match whole"
+        );
+        assert_eq!(
+            wayland_display_path(false, ""),
+            Some(WaylandDisplayPath::Native)
+        );
+    }
+
+    /// A config as `eglChooseConfig` sees it.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct FakeConfig {
+        surface_type: khronos_egl::Int,
+        renderable_type: khronos_egl::Int,
+        native_renderable: bool,
+        alpha_size: khronos_egl::Int,
+    }
+
+    /// The first of `configs` matching an attribute list, by `eglChooseConfig`'s rules for the
+    /// attributes `choose_config` uses.
+    fn first_match(configs: &[FakeConfig], attributes: &[khronos_egl::Int]) -> Option<FakeConfig> {
+        configs.iter().copied().find(|config| {
+            attributes.chunks(2).all(|pair| match *pair {
+                [khronos_egl::NONE] | [khronos_egl::NONE, _] => true,
+                [khronos_egl::SURFACE_TYPE, bits] => config.surface_type & bits == bits,
+                [khronos_egl::RENDERABLE_TYPE, bits] => config.renderable_type & bits == bits,
+                [khronos_egl::NATIVE_RENDERABLE, value] => {
+                    config.native_renderable == (value == khronos_egl::TRUE as khronos_egl::Int)
+                }
+                [khronos_egl::ALPHA_SIZE, size] => config.alpha_size >= size,
+                _ => panic!("unexpected attribute {pair:?}"),
+            })
+        })
+    }
+
+    fn tier(configs: &[FakeConfig], alpha: bool) -> Option<usize> {
+        choose_tier(CONFIG_TIERS, alpha, |_, attributes| {
+            first_match(configs, attributes)
+        })
+        .map(|(_, tier)| tier)
+    }
+
+    #[test]
+    fn config_tiers() {
+        let all_surfaces = khronos_egl::WINDOW_BIT | khronos_egl::PBUFFER_BIT;
+        let mesa = FakeConfig {
+            surface_type: all_surfaces,
+            renderable_type: khronos_egl::OPENGL_ES2_BIT,
+            native_renderable: true,
+            alpha_size: 8,
+        };
+        // Issue #10708: window and pbuffer surfaces, but not natively renderable.
+        let mali = FakeConfig {
+            native_renderable: false,
+            ..mesa
+        };
+        let pbuffer_only = FakeConfig {
+            surface_type: khronos_egl::PBUFFER_BIT,
+            ..mali
+        };
+        let native_tier = CONFIG_TIERS.len() - 1;
+        assert_eq!(tier(&[mesa], true), Some(native_tier));
+        assert_eq!(
+            tier(&[mali, mesa], true),
+            Some(native_tier),
+            "the best tier wins"
+        );
+        assert_eq!(tier(&[mali], true), Some(1));
+        assert_eq!(tier(&[pbuffer_only], false), Some(0));
+        assert_eq!(
+            tier(
+                &[FakeConfig {
+                    alpha_size: 0,
+                    ..mesa
+                }],
+                true
+            ),
+            None,
+            "sRGB needs alpha"
+        );
+        assert_eq!(tier(&[], false), None);
+
+        // The presentation tier presents on Wayland; X11 still asks for native rendering.
+        assert!(1 >= presentable_tier(WindowKind::Wayland));
+        assert!(0 < presentable_tier(WindowKind::Wayland));
+        if !cfg!(any(target_os = "android", windows, target_env = "ohos")) {
+            assert_eq!(presentable_tier(WindowKind::X11), 2);
+            assert_eq!(presentable_tier(WindowKind::Unknown), 2);
+        }
+    }
+
+    #[test]
+    fn render_buffer() {
+        use khronos_egl::{Error, BACK_BUFFER, SINGLE_BUFFER};
+
+        assert_eq!(super::render_buffer(WindowKind::AngleX11), BACK_BUFFER);
+        if !cfg!(any(
+            target_os = "android",
+            target_os = "macos",
+            target_env = "ohos",
+            windows
+        )) {
+            assert_eq!(super::render_buffer(WindowKind::Wayland), SINGLE_BUFFER);
+            assert_eq!(super::render_buffer(WindowKind::X11), SINGLE_BUFFER);
+        }
+        assert_eq!(
+            render_buffer_retry(SINGLE_BUFFER, Error::BadAttribute),
+            Some(BACK_BUFFER)
+        );
+        assert_eq!(
+            render_buffer_retry(SINGLE_BUFFER, Error::BadMatch),
+            Some(BACK_BUFFER)
+        );
+        assert_eq!(
+            render_buffer_retry(SINGLE_BUFFER, Error::BadNativeWindow),
+            None,
+            "other failures are not about the render buffer"
+        );
+        assert_eq!(
+            render_buffer_retry(BACK_BUFFER, Error::BadAttribute),
+            None,
+            "retried once"
+        );
+    }
 }
