@@ -206,6 +206,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 
 #### GLES
 
+- Implement `PipelineCache` with program binaries where the context offers them (GL ES 3.0, GL 4.1, `GL_ARB_get_program_binary`): `Features::PIPELINE_CACHE` is reported, programs load with `glProgramBinary` from cache data and fall back to compiling when the driver rejects them, and `util::pipeline_cache_key` returns a key for GL. By @dXnSix.
 - Add ANGLE as an opt-in OpenGL backend on Windows via `cfg(windows_angle)`, while keeping the `angle` feature for ANGLE on macOS/iOS. By @csmoe in [#9422](https://github.com/gfx-rs/wgpu/pull/9422).
 
 #### WebGL

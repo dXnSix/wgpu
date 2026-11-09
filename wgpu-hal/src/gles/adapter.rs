@@ -640,6 +640,20 @@ impl super::Adapter {
             features |= wgt::Features::POLYGON_MODE_LINE | wgt::Features::POLYGON_MODE_POINT;
         }
 
+        // Program binaries (core in GL ES 3.0 and GL 4.1) back the pipeline cache when the driver
+        // offers at least one binary format.
+        let program_binaries = if cfg!(native)
+            && (es_ver.is_some_and(|v| v >= (3, 0))
+                || full_ver.is_some_and(|v| v >= (4, 1))
+                || extensions.contains("GL_ARB_get_program_binary"))
+            && unsafe { gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS) } > 0
+        {
+            Some(super::pipeline_cache::adapter_key(&renderer, &version))
+        } else {
+            None
+        };
+        features.set(wgt::Features::PIPELINE_CACHE, program_binaries.is_some());
+
         // We *might* be able to emulate bgra8unorm-storage but currently don't attempt to.
 
         let mut private_caps = super::PrivateCapabilities::empty();
@@ -978,6 +992,7 @@ impl super::Adapter {
                     shading_language_version,
                     next_shader_id: Default::default(),
                     program_cache: Default::default(),
+                    program_binaries,
                     es: es_ver.is_some(),
                     max_msaa_samples: max_samples,
                 }),
@@ -1142,6 +1157,7 @@ impl crate::Adapter for super::Adapter {
                 #[cfg(all(native, feature = "renderdoc"))]
                 render_doc: Default::default(),
                 counters: Default::default(),
+                program_binary_counts: Default::default(),
             },
             queue: super::Queue {
                 shared: Arc::clone(&self.shared),

@@ -233,6 +233,27 @@ fn adapter_key(adapter: &AdapterInfo) -> Result<[u8; 15], PipelineCacheValidatio
             ];
             Ok(adapter)
         }
+        wgt::Backend::Gl => {
+            // GL reports no device id: the renderer and version strings identify the driver
+            // (`GL_RENDERER`, `GL_VERSION`); the backend validates its data against them again.
+            let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+            for byte in adapter
+                .name
+                .bytes()
+                .chain([0])
+                .chain(adapter.driver_info.bytes())
+            {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            let v: [u8; 4] = adapter.vendor.to_be_bytes();
+            let h: [u8; 8] = hash.to_be_bytes();
+            let adapter = [
+                254, 254, 254, v[0], v[1], v[2], v[3], h[0], h[1], h[2], h[3], h[4], h[5], h[6],
+                h[7],
+            ];
+            Ok(adapter)
+        }
         _ => Err(PipelineCacheValidationError::Unsupported),
     }
 }
@@ -538,5 +559,39 @@ mod tests {
         let cache = cache.into_iter().flatten().collect::<Vec<u8>>();
         let validation_result = super::validate_pipeline_cache(&cache, &ADAPTER, VALIDATION_KEY);
         assert_eq!(validation_result, Err(E::Corrupted));
+    }
+
+    #[test]
+    fn gl_adapters_are_keyed_by_renderer_and_version() {
+        let gl = |name: &str, version: &str| AdapterInfo {
+            name: name.into(),
+            driver_info: version.into(),
+            backend: wgt::Backend::Gl,
+            ..ADAPTER
+        };
+        let llvmpipe = gl(
+            "llvmpipe (LLVM 19.1.1, 128 bits)",
+            "4.5 (Core Profile) Mesa 25.0.7",
+        );
+        let mut header = [0; HEADER_LENGTH];
+        super::add_cache_header(&mut header, &[], &llvmpipe, VALIDATION_KEY);
+        assert_eq!(
+            super::validate_pipeline_cache(&header, &llvmpipe, VALIDATION_KEY),
+            Ok(&[][..])
+        );
+        let updated = gl(
+            "llvmpipe (LLVM 19.1.1, 128 bits)",
+            "4.5 (Core Profile) Mesa 25.2.0",
+        );
+        assert_eq!(
+            super::validate_pipeline_cache(&header, &updated, VALIDATION_KEY),
+            Err(E::DeviceMismatch),
+            "another driver version"
+        );
+        let mali = gl("Mali-G52", "OpenGL ES 3.2 v1.r26p0");
+        assert_eq!(
+            super::validate_pipeline_cache(&header, &mali, VALIDATION_KEY),
+            Err(E::DeviceMismatch)
+        );
     }
 }

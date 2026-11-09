@@ -95,6 +95,7 @@ pub use self::egl::{AdapterContext, AdapterContextLock, Instance, Surface};
 mod emscripten;
 
 mod fence;
+mod pipeline_cache;
 mod queue;
 
 #[cfg(webgl)]
@@ -290,6 +291,9 @@ struct AdapterShared {
     shading_language_version: naga::back::glsl::Version,
     next_shader_id: AtomicU32,
     program_cache: Mutex<ProgramCache>,
+    /// The adapter key of program binaries (`GL_RENDERER` and `GL_VERSION`), when the context
+    /// supports them (`GL_NUM_PROGRAM_BINARY_FORMATS > 0`); `Features::PIPELINE_CACHE` then.
+    program_binaries: Option<[u8; 16]>,
     es: bool,
 
     /// Result of `gl.get_parameter_i32(glow::MAX_SAMPLES)`.
@@ -310,6 +314,7 @@ impl fmt::Debug for AdapterShared {
             shading_language_version,
             next_shader_id,
             program_cache: _,
+            program_binaries,
             es,
             max_msaa_samples,
         } = self;
@@ -321,6 +326,7 @@ impl fmt::Debug for AdapterShared {
             .field("options", options)
             .field("shading_language_version", shading_language_version)
             .field("next_shader_id", next_shader_id)
+            .field("program_binaries", program_binaries)
             .field("es", es)
             .field("max_msaa_samples", max_msaa_samples)
             .finish_non_exhaustive()
@@ -339,6 +345,14 @@ pub struct Device {
     #[cfg(all(native, feature = "renderdoc"))]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
+    program_binary_counts: ProgramBinaryCounts,
+}
+
+/// How this device's programs came from pipeline caches (see [`Device::program_binary_counts`]).
+#[derive(Debug, Default)]
+struct ProgramBinaryCounts {
+    loaded: AtomicU32,
+    rejected: AtomicU32,
 }
 
 impl Drop for Device {
@@ -793,8 +807,11 @@ pub struct AccelerationStructure;
 
 impl crate::DynAccelerationStructure for AccelerationStructure {}
 
+/// Program binaries by program key (see `pipeline_cache`).
 #[derive(Debug)]
-pub struct PipelineCache;
+pub struct PipelineCache {
+    entries: Mutex<alloc::collections::BTreeMap<[u8; 16], pipeline_cache::Binary>>,
+}
 
 impl crate::DynPipelineCache for PipelineCache {}
 
