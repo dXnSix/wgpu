@@ -424,6 +424,7 @@ By @cwfitzgerald in [#8388](https://github.com/gfx-rs/wgpu/pull/8388).
 
 #### GLES
 
+- Support EGL 1.4 drivers on Wayland, such as Mali's: get the display with `eglGetPlatformDisplayEXT` or `eglGetDisplay` when `eglGetPlatformDisplay` is missing, let window-capable configs present on Wayland without `EGL_NATIVE_RENDERABLE`, and retry window surfaces with `EGL_BACK_BUFFER` when `EGL_SINGLE_BUFFER` is refused. By @dXnSix in [#10708](https://github.com/gfx-rs/wgpu/issues/10708).
 - Prevent WGL applications on Windows from becoming unresponsive during input language changes. By @acarl005 in [#10505](https://github.com/gfx-rs/wgpu/pull/10505).
 - Fix OpenGL initialization failures on Windows under Parallels by explicitly requesting the highest supported core version (4.6 down to 3.3) and retrying initial context creation once on failure. By @jimm98y in [#10554](https://github.com/gfx-rs/wgpu/pull/10554).
 - Enable `TEXTURE_CUBE_MAP_SEAMLESS` on desktop OpenGL so cube maps sample seamlessly across face edges, matching OpenGL ES 3.0+, WebGL 2, Vulkan, Metal, and Direct3D 12. By @kuntal-devrat in [#10628](https://github.com/gfx-rs/wgpu/pull/10628).
