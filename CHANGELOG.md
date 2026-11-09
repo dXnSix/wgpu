@@ -365,6 +365,7 @@ By @alextechcc in [#8014](https://github.com/gfx-rs/wgpu/pull/8014).
 
 #### GLES
 
+- Support EGL 1.4 drivers on Wayland, such as Mali's: get the display with `eglGetPlatformDisplayEXT` or `eglGetDisplay` when `eglGetPlatformDisplay` is missing, let window-capable configs present on Wayland without `EGL_NATIVE_RENDERABLE`, and retry window surfaces with `EGL_BACK_BUFFER` when `EGL_SINGLE_BUFFER` is refused. By @dXnSix in [#10708](https://github.com/gfx-rs/wgpu/issues/10708).
 - Enable `TEXTURE_CUBE_MAP_SEAMLESS` on desktop OpenGL so cube maps sample seamlessly across face edges, matching OpenGL ES 3.0+, WebGL 2, Vulkan, Metal, and Direct3D 12. By @kuntal-devrat in [#10628](https://github.com/gfx-rs/wgpu/pull/10628).
 - Fix black EGL surfaces on some platforms by selecting the default framebuffer's color buffer before presentation. By @valadaptive in [#10268](https://github.com/gfx-rs/wgpu/pull/10268).
 - Avoid duplicate `EGL_SURFACE_TYPE` attributes when selecting an EGL framebuffer configuration, which caused Mesa to return no matching configurations. By @BlueJayLouche and @scroix in [#10048](https://github.com/gfx-rs/wgpu/pull/10048).
