@@ -123,15 +123,6 @@ impl CompilationContext<'_> {
 }
 
 impl super::Device {
-    /// How many programs this device loaded from pipeline-cache program binaries, and how many
-    /// cached binaries the driver rejected (those programs were compiled instead).
-    pub fn program_binary_counts(&self) -> (u32, u32) {
-        (
-            self.program_binary_counts.loaded.load(Ordering::Relaxed),
-            self.program_binary_counts.rejected.load(Ordering::Relaxed),
-        )
-    }
-
     /// # Safety
     ///
     /// - `name` must be created respecting `desc`
@@ -456,6 +447,21 @@ impl super::Device {
             .to_owned()?;
         drop(guard);
 
+        // Every program the pipeline uses goes into the cache, also one an earlier pipeline
+        // linked (the program cache above shares it) or one loaded from the cache's own data.
+        if let (Some(cache), Some(key)) = (cache, program.binary_key) {
+            if let alloc::collections::btree_map::Entry::Vacant(entry) =
+                cache.entries.lock().entry(key)
+            {
+                if let Some(binary) = unsafe { gl.get_program_binary(program.program) } {
+                    entry.insert(super::pipeline_cache::Binary {
+                        format: binary.format,
+                        data: binary.buffer,
+                    });
+                }
+            }
+        }
+
         Ok(program)
     }
 
@@ -532,14 +538,15 @@ impl super::Device {
             ));
         }
 
-        // A program binary from the pipeline cache replaces compiling and linking.
-        let binary_key = match (cache, self.shared.program_binaries) {
-            (Some(_), Some(adapter)) => Some(super::pipeline_cache::program_key(
+        // A program binary from the pipeline cache replaces compiling and linking. Programs are
+        // keyed whenever the context has program binaries, so a later pipeline with a cache can
+        // store a program an earlier one linked.
+        let binary_key = self.shared.program_binaries.map(|adapter| {
+            super::pipeline_cache::program_key(
                 &adapter,
                 sources.iter().map(|(_, source, _)| source.as_ref()),
-            )),
-            _ => None,
-        };
+            )
+        });
         let cached = cache
             .zip(binary_key)
             .and_then(|(cache, key)| cache.entries.lock().get(&key).cloned());
@@ -552,16 +559,14 @@ impl super::Device {
             unsafe { gl.program_binary(program, &binary) };
             if unsafe { gl.get_program_link_status(program) } {
                 log::debug!("\tLoaded program {program:?} from its binary");
-                self.program_binary_counts
-                    .loaded
-                    .fetch_add(1, Ordering::Relaxed);
                 linked_from_binary = true;
             } else {
-                // The driver changed or the binary is unusable: compile instead.
+                // The driver changed or the binary is unusable: compile instead, and let the
+                // fresh binary replace the rejected one.
                 log::debug!("\tThe driver rejected the program binary; compiling");
-                self.program_binary_counts
-                    .rejected
-                    .fetch_add(1, Ordering::Relaxed);
+                if let (Some(cache), Some(key)) = (cache, binary_key) {
+                    cache.entries.lock().remove(&key);
+                }
             }
         }
 
@@ -601,18 +606,6 @@ impl super::Device {
             }
             if !msg.is_empty() {
                 log::debug!("\tLink message: {msg}");
-            }
-
-            if let (Some(cache), Some(key)) = (cache, binary_key) {
-                if let Some(binary) = unsafe { gl.get_program_binary(program) } {
-                    cache.entries.lock().insert(
-                        key,
-                        super::pipeline_cache::Binary {
-                            format: binary.format,
-                            data: binary.buffer,
-                        },
-                    );
-                }
             }
         }
 
@@ -676,6 +669,7 @@ impl super::Device {
 
         Ok(Arc::new(super::PipelineInner {
             program,
+            binary_key,
             sampler_map,
             first_instance_location,
             immediates_descs: uniforms,
