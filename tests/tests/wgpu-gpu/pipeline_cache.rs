@@ -26,10 +26,16 @@ const ARRAY_SIZE: u64 = 256;
 
 /// Create a shader which should be slow-ish to compile
 fn shader() -> String {
+    shader_with_offset(0)
+}
+
+/// A shader writing `index + offset` to each element.
+fn shader_with_offset(offset: u64) -> String {
     let mut body = String::new();
     for idx in 0..ARRAY_SIZE {
         // "Safety": There will only be a single workgroup, and a single thread in that workgroup
-        writeln!(body, "    output[{idx}] = {idx}u;")
+        let value = idx + offset;
+        writeln!(body, "    output[{idx}] = {value}u;")
             .expect("`u64::fmt` and `String::write_fmt` are infallible");
     }
 
@@ -160,6 +166,20 @@ async fn validate_pipeline(
     gpu_buffer: &wgpu::Buffer,
     cpu_buffer: &wgpu::Buffer,
 ) {
+    assert_eq!(
+        run_pipeline(ctx, pipeline, bind_group, gpu_buffer, cpu_buffer).await,
+        0
+    );
+}
+
+/// Runs the pipeline and returns the offset its output has from the element indices.
+async fn run_pipeline(
+    ctx: &TestingContext,
+    pipeline: wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    gpu_buffer: &wgpu::Buffer,
+    cpu_buffer: &wgpu::Buffer,
+) -> u64 {
     let mut encoder = ctx
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -189,16 +209,22 @@ async fn validate_pipeline(
     let arrays: &[u32] = bytemuck::cast_slice(&data);
 
     assert_eq!(arrays.len(), ARRAY_SIZE as usize);
+    let offset = u64::from(arrays[0]);
     for (idx, value) in arrays.iter().copied().enumerate() {
-        assert_eq!(value as usize, idx);
+        assert_eq!(u64::from(value), idx as u64 + offset);
     }
     drop(data);
     cpu_buffer.unmap();
+    offset
 }
 
-/// On GL the cache holds program binaries: a pipeline created from a cache's data loads its
-/// program instead of compiling it and computes the same values, and corrupt data falls back to
-/// compiling. Other backends skip this test.
+/// On GL the cache holds program binaries. Other backends skip this test.
+///
+/// - A pipeline created with a cache whose data holds, under its program's key, the binary of
+///   another shader computes that shader's values: the program was loaded, not compiled.
+/// - A binary the driver rejects (garbage behind a valid entry) is compiled instead, and the
+///   fresh binary replaces it in the cache.
+/// - Corrupt data (a failed entry checksum) is dropped and the program compiled.
 #[apply(gpu_test!)]
 static PIPELINE_CACHE_GL_PROGRAM_BINARIES: GpuTestConfiguration = GpuTestConfiguration::new()
     .parameters(
@@ -208,25 +234,76 @@ static PIPELINE_CACHE_GL_PROGRAM_BINARIES: GpuTestConfiguration = GpuTestConfigu
     )
     .run_async(gl_program_binaries_test);
 
-/// The device's program binary counts (loaded, rejected), or `None` off GL.
-fn program_binary_counts(ctx: &TestingContext) -> Option<(u32, u32)> {
-    let device = unsafe { ctx.device.as_hal::<wgpu::hal::api::Gles>() }?;
-    Some(device.program_binary_counts())
+/// wgpu-core's header before the backend's data (`wgpu_core::pipeline_cache::HEADER_LENGTH`),
+/// and the offset of its big-endian data size.
+const CORE_HEADER: usize = 64;
+const CORE_DATA_SIZE: usize = 48;
+/// The GL backend's header (magic, version, adapter key, entry count); see
+/// `wgpu_hal::gles::pipeline_cache`.
+const GL_HEADER: usize = 8 + 4 + 16 + 4;
+
+/// One entry of GL cache data.
+#[derive(Clone, Debug, PartialEq)]
+struct GlEntry {
+    key: [u8; 16],
+    format: u32,
+    binary: Vec<u8>,
+}
+
+/// The only entry of GL cache data with one program.
+fn gl_entry(data: &[u8]) -> GlEntry {
+    let hal = &data[CORE_HEADER..];
+    assert_eq!(&hal[..8], b"WGPUGLPB");
+    assert_eq!(
+        u32::from_le_bytes(hal[28..32].try_into().unwrap()),
+        1,
+        "one entry"
+    );
+    let entry = &hal[GL_HEADER..];
+    let length = u32::from_le_bytes(entry[20..24].try_into().unwrap()) as usize;
+    GlEntry {
+        key: entry[..16].try_into().unwrap(),
+        format: u32::from_le_bytes(entry[16..20].try_into().unwrap()),
+        binary: entry[24..24 + length].to_vec(),
+    }
+}
+
+/// The entry checksum of `wgpu_hal::gles::pipeline_cache` (two FNV-1a lanes).
+fn gl_checksum(entry: &GlEntry) -> u64 {
+    let mut lanes = [0xcbf2_9ce4_8422_2325u64, 0x6c62_272e_07bb_0142];
+    let mut write = |bytes: &[u8]| {
+        for lane in &mut lanes {
+            for &byte in bytes {
+                *lane ^= u64::from(byte);
+                *lane = lane.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    };
+    write(&16u64.to_le_bytes());
+    write(&entry.key);
+    write(&entry.format.to_le_bytes());
+    write(&(entry.binary.len() as u64).to_le_bytes());
+    write(&entry.binary);
+    lanes[0] ^ lanes[1].rotate_left(32)
+}
+
+/// `data` (one program) with its entry replaced by `entry`, checksummed and sized correctly.
+fn with_gl_entry(data: &[u8], entry: &GlEntry) -> Vec<u8> {
+    let mut out = data[..CORE_HEADER + GL_HEADER].to_vec();
+    out.extend_from_slice(&entry.key);
+    out.extend_from_slice(&entry.format.to_le_bytes());
+    out.extend_from_slice(&(entry.binary.len() as u32).to_le_bytes());
+    out.extend_from_slice(&entry.binary);
+    out.extend_from_slice(&gl_checksum(entry).to_le_bytes());
+    let size = (out.len() - CORE_HEADER) as u64;
+    out[CORE_DATA_SIZE..CORE_DATA_SIZE + 8].copy_from_slice(&size.to_be_bytes());
+    out
 }
 
 async fn gl_program_binaries_test(ctx: TestingContext) {
-    if program_binary_counts(&ctx).is_none() {
+    if unsafe { ctx.device.as_hal::<wgpu::hal::api::Gles>() }.is_none() {
         return;
     }
-    let source = shader();
-    // A new module each time: GL reuses a linked program for the same module and layout.
-    let module = || {
-        ctx.device
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("shader"),
-                source: wgpu::ShaderSource::Wgsl(source.as_str().into()),
-            })
-    };
     let bgl = ctx
         .device
         .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -277,73 +354,108 @@ async fn gl_program_binaries_test(ctx: TestingContext) {
                 fallback: true,
             })
     };
-    let pipeline = |cache: &wgpu::PipelineCache| {
+    // A new module for every pipeline: GL reuses a linked program for the same module and
+    // layout, which would never reach the cache's data.
+    let run = |offset: u64, cache: &wgpu::PipelineCache| {
+        let source = shader_with_offset(offset);
+        let module = ctx
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("shader"),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+        let pipeline = ctx
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("pipeline"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: Some(cache),
+            });
+        run_pipeline(&ctx, pipeline, &bind_group, &gpu_buffer, &cpu_buffer)
+    };
+
+    // The binaries of two shaders, one cache each.
+    let plain = cache(None);
+    assert_eq!(run(0, &plain).await, 0);
+    let plain_data = plain.get_data().expect("GL caches have data");
+    let plain_entry = gl_entry(&plain_data);
+    let shifted = cache(None);
+    assert_eq!(run(1000, &shifted).await, 1000);
+    let shifted_entry = gl_entry(&shifted.get_data().unwrap());
+    assert_ne!(plain_entry.key, shifted_entry.key);
+
+    // The plain shader's key with the shifted shader's binary: the program is loaded from the
+    // data, so it computes the shifted values.
+    let swapped = with_gl_entry(
+        &plain_data,
+        &GlEntry {
+            key: plain_entry.key,
+            ..shifted_entry.clone()
+        },
+    );
+    assert_eq!(
+        run(0, &cache(Some(&swapped))).await,
+        1000,
+        "the pipeline used the cached binary instead of compiling its shader"
+    );
+
+    // Valid data the driver rejects: compiled instead, and the fresh binary replaces it.
+    let rejected = cache(Some(&with_gl_entry(
+        &plain_data,
+        &GlEntry {
+            binary: vec![0xab; 64],
+            ..plain_entry.clone()
+        },
+    )));
+    assert_eq!(run(0, &rejected).await, 0, "compiled after the rejection");
+    let replaced = gl_entry(&rejected.get_data().unwrap());
+    assert_eq!(replaced.key, plain_entry.key);
+    assert_ne!(
+        replaced.binary,
+        vec![0xab; 64],
+        "the rejected binary is gone"
+    );
+
+    // Corrupt data: the entry fails its checksum, is dropped, and the program is compiled.
+    let mut corrupt = plain_data.clone();
+    let last = corrupt.len() - 9;
+    corrupt[last] ^= 0xff;
+    let corrupt = cache(Some(&corrupt));
+    assert_eq!(run(0, &corrupt).await, 0);
+    assert_eq!(gl_entry(&corrupt.get_data().unwrap()).key, plain_entry.key);
+
+    // A program an earlier pipeline linked goes into a cache passed later.
+    let warm = cache(None);
+    let module = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shader"),
+            source: wgpu::ShaderSource::Wgsl(shader_with_offset(7).into()),
+        });
+    let pipeline = |cache: Option<&wgpu::PipelineCache>| {
         ctx.device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("pipeline"),
                 layout: Some(&layout),
-                module: &module(),
+                module: &module,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: Some(cache),
+                cache,
             })
     };
-
-    // First run: compile, link and store the binary.
-    let first = cache(None);
-    validate_pipeline(
-        &ctx,
-        pipeline(&first),
-        &bind_group,
-        &gpu_buffer,
-        &cpu_buffer,
-    )
-    .await;
-    assert_eq!(program_binary_counts(&ctx), Some((0, 0)));
-    let data = first.get_data().expect("GL caches have data");
-
-    // Second run from the data: the program is loaded, not compiled, and computes the same.
-    let second = cache(Some(&data));
-    validate_pipeline(
-        &ctx,
-        pipeline(&second),
-        &bind_group,
-        &gpu_buffer,
-        &cpu_buffer,
-    )
-    .await;
+    let first = pipeline(None);
+    let second = pipeline(Some(&warm));
     assert_eq!(
-        program_binary_counts(&ctx),
-        Some((1, 0)),
-        "the second pipeline loaded its program binary"
+        run_pipeline(&ctx, second, &bind_group, &gpu_buffer, &cpu_buffer).await,
+        7
     );
-    assert_eq!(
-        second.get_data().as_deref(),
-        Some(&data[..]),
-        "the loaded entry stays in the cache"
-    );
-
-    // Corrupt data: the damaged entry is dropped and the program compiled again.
-    let mut corrupt = data.clone();
-    let last = corrupt.len() - 9;
-    corrupt[last] ^= 0xff;
-    let third = cache(Some(&corrupt));
-    validate_pipeline(
-        &ctx,
-        pipeline(&third),
-        &bind_group,
-        &gpu_buffer,
-        &cpu_buffer,
-    )
-    .await;
-    assert_eq!(
-        program_binary_counts(&ctx),
-        Some((1, 0)),
-        "nothing was loaded from corrupt data"
-    );
-    assert_eq!(
-        third.get_data().as_deref(),
-        Some(&data[..]),
-        "the recompiled program's binary replaced the damaged one"
+    drop(first);
+    assert!(
+        warm.get_data()
+            .is_some_and(|data| !gl_entry(&data).binary.is_empty()),
+        "the shared program's binary was stored"
     );
 }
