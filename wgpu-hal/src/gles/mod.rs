@@ -345,14 +345,6 @@ pub struct Device {
     #[cfg(all(native, feature = "renderdoc"))]
     render_doc: crate::auxil::renderdoc::RenderDoc,
     counters: Arc<wgt::HalCounters>,
-    program_binary_counts: ProgramBinaryCounts,
-}
-
-/// How this device's programs came from pipeline caches (see [`Device::program_binary_counts`]).
-#[derive(Debug, Default)]
-struct ProgramBinaryCounts {
-    loaded: AtomicU32,
-    rejected: AtomicU32,
 }
 
 impl Drop for Device {
@@ -708,6 +700,8 @@ type SamplerBindMap = [Option<u8>; MAX_TEXTURE_SLOTS];
 #[derive(Debug)]
 struct PipelineInner {
     program: glow::Program,
+    /// The program's key in pipeline caches, when the context supports program binaries.
+    binary_key: Option<[u8; 16]>,
     sampler_map: SamplerBindMap,
     first_instance_location: Option<glow::UniformLocation>,
     immediates_descs: ArrayVec<ImmediateDesc, MAX_IMMEDIATES_COMMANDS>,
